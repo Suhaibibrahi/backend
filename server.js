@@ -1,325 +1,447 @@
-const express = require('express');
-const cors = require('cors');
-const { MongoClient } = require('mongodb');
-const bcrypt = require('bcryptjs'); // For password hashing
-const nodemailer = require('nodemailer'); // For email notifications
-const crypto = require('crypto'); // For generating secure tokens
+/***************************************************************
+ * server.js
+ *  - Node/Express server with:
+ *    - MongoDB (via official driver)
+ *    - JWT auth
+ *    - Basic user registration, login, password reset
+ *    - Helmet, rate limiting
+ *    - Example route mounting (FCIF, Schedules, etc.)
+ ***************************************************************/
 
+require("dotenv").config(); // Load environment variables
+const express = require("express");
+const cors = require("cors");
+const { MongoClient } = require("mongodb");
+const bcrypt = require("bcryptjs");
+const nodemailer = require("nodemailer");
+const crypto = require("crypto");
+const helmet = require("helmet");
+const rateLimit = require("express-rate-limit");
+const jwt = require("jsonwebtoken");
+
+// 1) Express setup
 const app = express();
-const PORT = 5000;
+const PORT = process.env.PORT || 5000;
 
-// MongoDB Atlas connection URI
-const uri = "mongodb+srv://Suhaib:Suha1993ib@sq23rdapp.d77lc.mongodb.net/?retryWrites=true&w=majority&tls=true&tlsAllowInvalidCertificates=true";
+// 2) Environment Config
+const MONGO_URI = process.env.MONGO_URI;
+if (!MONGO_URI) {
+  console.error("Error: MONGO_URI is not set in .env!");
+  process.exit(1);
+}
+const JWT_SECRET = process.env.JWT_SECRET || "SomeFallbackSecretKey";
 
-// Create a MongoClient object to interact with MongoDB
-const client = new MongoClient(uri);
+// 3) Connect to MongoDB
+let client;
+let db;
+async function connectToDatabase() {
+  try {
+    client = new MongoClient(MONGO_URI);
+    await client.connect();
+    db = client.db("SQ23rdApp"); // or another DB name if you like
+    console.log("Connected to MongoDB!");
 
-// Use middleware for CORS and JSON parsing
+    // Attach the db to our Express app so sub-routes can access via req.app.locals.db
+    app.locals.db = db;
+  } catch (error) {
+    console.error("Error connecting to MongoDB:", error.message);
+    process.exit(1);
+  }
+}
+connectToDatabase();
+
+// Graceful shutdown on Ctrl+C
+process.on("SIGINT", async () => {
+  try {
+    if (client) {
+      await client.close();
+      console.log("MongoDB connection closed.");
+    }
+  } catch (error) {
+    console.error("Error closing MongoDB connection:", error.message);
+  } finally {
+    process.exit(0);
+  }
+});
+
+// 4) Middleware
+app.use(express.json()); // parse JSON bodies
 app.use(cors());
-app.use(express.json());
+app.use(helmet());
 
-// Middleware to log all incoming requests
+// Rate limiting
+const limiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 100,
+});
+app.use(limiter);
+
+// Simple request logger
 app.use((req, res, next) => {
   console.log(`${req.method} ${req.url}`);
   next();
 });
 
-// Global variable to hold the database connection
-let db;
-
-// Connect to MongoDB once at the start
-async function connectToDatabase() {
-  try {
-    await client.connect();
-    db = client.db("SQ23rdApp"); // Set database instance
-    console.log("Connected to MongoDB!");
-  } catch (error) {
-    console.error("Error connecting to MongoDB:", error);
-    process.exit(1); // Stop the server if DB connection fails
-  }
-}
-
-// --- Nodemailer Configuration ---
+// 5) Nodemailer Setup
 const transporter = nodemailer.createTransport({
-  host: 'smtp.mail.me.com', // iCloud SMTP server
-  port: 587, // SMTP port for iCloud
-  secure: false, // Use STARTTLS
+  service: "iCloud", 
   auth: {
-    user: 'suhaib.c130j@icloud.com', // iCloud email
-    pass: 'obbn-mxqf-pbqb-vuvz', // App-specific password
+    user: process.env.EMAIL_USER,  // e.g. "suhaib.c130j@icloud.com"
+    pass: process.env.EMAIL_PASS,  // e.g. "hesk-qpim-bpru-wlsx"
   },
 });
 
-const sendEmail = async (to, subject, text) => {
+/** Helper to send email */
+async function sendEmail(to, subject, text) {
   try {
-    await transporter.sendMail({
-      from: '"23rd Tactical Airlift Squadron" <suhaib.c130j@icloud.com>', // Sender's email
-      to, // Recipient's email
-      subject, // Email subject
-      text, // Email body
+    console.log(`Attempting to send email to: ${to}`);
+    const info = await transporter.sendMail({
+      from: `"23rd Tactical Airlift Squadron" <${process.env.EMAIL_USER}>`,
+      to,
+      subject,
+      text,
     });
-    console.log(`Email sent to ${to}`);
+    console.log(`Email successfully sent to ${to}: ${info.response}`);
+    return true;
   } catch (error) {
-    console.error("Error sending email:", error.message);
+    console.error(`Error sending email to ${to}:`, error.message);
+    return false;
   }
-};
+}
 
-// --- Input Validation ---
-const isValidEmail = (email) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
-const isValidPassword = (password) => /^(?=.*[A-Za-z])(?=.*\d)[A-Za-z\d]{8,}$/.test(password);
+// 6) Validation Helpers
+function isValidEmailFormat(email) {
+  const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+  return typeof email === "string" && emailRegex.test(email);
+}
+function isValidPasswordFormat(password) {
+  // at least 8 chars, 1 letter, 1 digit
+  const passwordRegex = /^(?=.*[A-Za-z])(?=.*\d)[A-Za-z\d]{8,}$/;
+  return typeof password === "string" && passwordRegex.test(password);
+}
 
-// --- Registration Endpoint ---
-app.post('/register', async (req, res) => {
+// 7) JWT Auth Helpers
+function generateToken(user) {
+  // sign with user._id and user.role
+  return jwt.sign(
+    {
+      userId: user._id.toString(),
+      role: user.role,
+    },
+    JWT_SECRET,
+    { expiresIn: "8h" }
+  );
+}
+
+function authMiddleware(req, res, next) {
+  const authHeader = req.headers.authorization;
+  if (!authHeader) {
+    return res.status(401).json({ message: "No Authorization header provided." });
+  }
+  const token = authHeader.split(" ")[1]; // Bearer <token>
+  if (!token) {
+    return res.status(401).json({ message: "Token not found in header." });
+  }
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET);
+    req.user = decoded; // e.g. { userId, role, iat, exp }
+    next();
+  } catch (err) {
+    console.error("Invalid or expired token:", err.message);
+    return res.status(403).json({ message: "Invalid or expired token." });
+  }
+}
+
+function requireRole(requiredRole) {
+  return (req, res, next) => {
+    if (!req.user || req.user.role !== requiredRole) {
+      return res
+        .status(403)
+        .json({ message: `Access denied. Requires ${requiredRole} role.` });
+    }
+    next();
+  };
+}
+
+// 8) Registration & Login Endpoints
+app.post("/register", async (req, res) => {
   const { email, password } = req.body;
 
   if (!email || !password) {
-    return res.status(400).json({ message: 'Email and password are required.' });
+    return res.status(400).json({ message: "Email and password are required." });
   }
-
-  // Validate email format
-  if (!isValidEmail(email)) {
-    return res.status(400).json({ message: 'Invalid email format.' });
+  if (!isValidEmailFormat(email)) {
+    return res.status(400).json({ message: "Invalid email format." });
   }
-
-  // Validate password complexity
-  if (!isValidPassword(password)) {
+  if (!isValidPasswordFormat(password)) {
     return res.status(400).json({
-      message: 'Password must be at least 8 characters long and include at least one letter and one number.',
+      message: "Password must be at least 8 characters and include a letter and a number.",
     });
   }
 
   try {
-    const usersCollection = db.collection("users");
-
-    // Check if the user already exists
-    const existingUser = await usersCollection.findOne({ personalEmail: email });
+    const usersColl = db.collection("users");
+    const existingUser = await usersColl.findOne({ personalEmail: email });
     if (existingUser) {
-      return res.status(400).json({ message: 'User already exists.' });
+      return res.status(400).json({ message: "User already exists." });
     }
 
-    // Generate a login email by replacing the domain with @sq23rd.com
-    const username = email.split('@')[0]; // Extract username (before @)
-    const loginEmail = `${username}@sq23rd.com`; // Append @sq23rd.com
-
-    // Hash the password
+    // Generate login email from personal email
+    const username = email.split("@")[0];
+    const loginEmail = `${username}@sq23rd.com`;
     const hashedPassword = await bcrypt.hash(password, 10);
 
-    // Insert the new user into the database
-    const newUser = {
-      personalEmail: email, // Store the user's original email
-      loginEmail: loginEmail, // Store the generated login email
-      password: hashedPassword, // Store the hashed password
-      status: 'pending', // Default status
-    };
-    await usersCollection.insertOne(newUser);
+    // If this is the first user, set role=owner, status=approved
+    const userCount = await usersColl.countDocuments();
+    const isFirstUser = userCount === 0;
 
-    res.status(201).json({
-      message: `Registration successful! Your login email will be ${loginEmail}. Your account is pending admin approval.`,
-    });
+    const newUser = {
+      personalEmail: email,
+      loginEmail,
+      password: hashedPassword,
+      status: isFirstUser ? "approved" : "pending",
+      role: isFirstUser ? "owner" : "user",
+    };
+
+    await usersColl.insertOne(newUser);
+
+    const msg = `Registration successful! Your login email will be ${loginEmail}. ${
+      isFirstUser
+        ? "You have been assigned as the owner of this system."
+        : "Your account is pending admin approval."
+    }`;
+
+    res.status(201).json({ message: msg });
   } catch (error) {
     console.error("Error during registration:", error.message);
-    res.status(500).json({ message: 'An error occurred. Please try again.' });
+    res.status(500).json({ message: "An error occurred. Please try again." });
   }
 });
 
-// --- Login Endpoint ---
-app.post('/login', async (req, res) => {
+app.post("/login", async (req, res) => {
   const { email, password } = req.body;
-
   if (!email || !password) {
-    return res.status(400).json({ message: 'Email and password are required.' });
+    return res.status(400).json({ message: "Email and password are required." });
   }
 
   try {
-    const usersCollection = db.collection("users");
-
-    // Find the user by login email
-    const user = await usersCollection.findOne({ loginEmail: email });
-
-    if (user) {
-      // Check if the user is approved
-      if (user.status !== 'approved') {
-        return res.status(403).json({ message: 'Your account is pending admin approval.' });
-      }
-
-      // Compare passwords
-      const isPasswordCorrect = await bcrypt.compare(password, user.password);
-      if (isPasswordCorrect) {
-        res.status(200).json({ message: 'Login successful!' });
-      } else {
-        res.status(401).json({ message: 'Invalid email or password.' });
-      }
-    } else {
-      res.status(401).json({ message: 'Invalid email or password.' });
+    const user = await db.collection("users").findOne({ loginEmail: email });
+    if (!user) {
+      return res.status(401).json({ message: "Invalid email or password." });
     }
+    if (user.status !== "approved") {
+      return res.status(403).json({ message: "Your account is pending admin approval." });
+    }
+
+    const isPasswordCorrect = await bcrypt.compare(password, user.password);
+    if (!isPasswordCorrect) {
+      return res.status(401).json({ message: "Invalid email or password." });
+    }
+
+    // Generate JWT
+    const token = generateToken(user);
+    res.status(200).json({
+      message: "Login successful!",
+      role: user.role,
+      token,
+    });
   } catch (error) {
     console.error("Error during login:", error.message);
-    res.status(500).json({ message: 'An error occurred. Please try again.' });
+    res.status(500).json({ message: "An error occurred. Please try again." });
   }
 });
 
-// --- Admin Approval Endpoint ---
-app.put('/approve/:email', async (req, res) => {
-  const { email } = req.params;
-
-  try {
-    const usersCollection = db.collection("users");
-
-    // Find the user by their login email
-    const user = await usersCollection.findOne({ loginEmail: email });
-
-    if (!user) {
-      return res.status(404).json({ message: 'User not found.' });
-    }
-
-    // Approve the user
-    await usersCollection.updateOne(
-      { loginEmail: email },
-      { $set: { status: 'approved' } }
-    );
-
-    // Send approval email
-    const subject = 'Your Account Has Been Approved';
-    const text = `
-      Dear User,
-
-      Congratulations! Your account has been approved by the admin. You can now log in using the following credentials:
-
-      Login Email: ${user.loginEmail}
-      Password: (the password you registered with)
-
-      Please contact support if you encounter any issues.
-
-      Best regards,
-      The 23rd Tactical Airlift Squadron Team
-    `;
-
-    await sendEmail(user.personalEmail, subject, text);
-
-    res.status(200).json({ message: 'User approved successfully and email sent!' });
-  } catch (error) {
-    console.error("Error approving user:", error.message);
-    res.status(500).json({ message: 'An error occurred. Please try again.' });
-  }
-});
-
-// --- Request Password Reset ---
-app.post('/request-password-reset', async (req, res) => {
+// 9) Password Reset
+app.post("/request-password-reset", async (req, res) => {
   const { email } = req.body;
-
   if (!email) {
-    return res.status(400).json({ message: 'Email is required.' });
+    return res.status(400).json({ message: "Email is required." });
   }
 
   try {
-    const usersCollection = db.collection("users");
-
-    // Find the user by their personal email
-    const user = await usersCollection.findOne({
-      personalEmail: { $regex: new RegExp(`^${email}$`, 'i') }, // Case-insensitive match
+    const usersColl = db.collection("users");
+    const user = await usersColl.findOne({
+      personalEmail: { $regex: new RegExp(`^${email.trim()}$`, "i") },
     });
-
     if (!user) {
-      return res.status(404).json({ message: 'User not found.' });
+      return res.status(404).json({ message: "User not found." });
     }
 
-    // Generate a secure token
-    const token = crypto.randomBytes(32).toString('hex');
-    const tokenExpiry = Date.now() + 3600000; // Token valid for 1 hour
+    // Generate token
+    const token = crypto.randomBytes(32).toString("hex");
+    const hashedToken = crypto.createHash("sha256").update(token).digest("hex");
+    const tokenExpiry = Date.now() + 3600000; // 1 hour
 
-    // Store the token and expiry in the database
-    await usersCollection.updateOne(
+    await usersColl.updateOne(
       { personalEmail: user.personalEmail },
-      { $set: { resetToken: token, resetTokenExpiry: tokenExpiry } }
+      { $set: { resetToken: hashedToken, resetTokenExpiry: tokenExpiry } }
     );
 
-    // Send the reset link via email
-    const resetLink = `http://localhost:5000/reset-password?token=${token}`;
-    const subject = 'Password Reset Request';
+    // Create the reset link
+    const resetLink = `${process.env.FRONTEND_URL}/reset-password?token=${token}`;
+    const subject = "Password Reset Request";
     const text = `
-      You requested a password reset. Click the link below to reset your password:
-      ${resetLink}
-      
-      This link will expire in 1 hour.
-      
-      If you did not request this reset, please ignore this email.
-    `;
+You requested a password reset. Click the link below to reset your password:
+${resetLink}
 
-    await sendEmail(user.personalEmail, subject, text);
+This link will expire in 1 hour.
 
-    res.status(200).json({ message: 'Password reset email sent!' });
+If you did not request this, please ignore this email.
+`;
+
+    const emailSent = await sendEmail(user.personalEmail, subject, text);
+    if (!emailSent) {
+      return res.status(500).json({ message: "Failed to send password reset email." });
+    }
+
+    res.status(200).json({ message: "Password reset email sent!" });
   } catch (error) {
     console.error("Error requesting password reset:", error.message);
-    res.status(500).json({ message: 'An error occurred. Please try again.' });
+    res.status(500).json({ message: "An error occurred. Please try again." });
   }
 });
 
-// --- Reset Password ---
-app.post('/reset-password', async (req, res) => {
+app.post("/reset-password", async (req, res) => {
   const { token, newPassword } = req.body;
-
   if (!token || !newPassword) {
-    return res.status(400).json({ message: 'Token and new password are required.' });
+    return res.status(400).json({ message: "Token and new password are required." });
   }
-
-  if (!isValidPassword(newPassword)) {
+  if (!isValidPasswordFormat(newPassword)) {
     return res.status(400).json({
-      message: 'Password must be at least 8 characters long and include at least one letter and one number.',
+      message: "Password must be at least 8 characters long and include at least one letter and one number.",
     });
   }
 
   try {
-    const usersCollection = db.collection("users");
+    const usersColl = db.collection("users");
+    const hashedToken = crypto.createHash("sha256").update(token).digest("hex");
 
-    // Find the user by reset token
-    const user = await usersCollection.findOne({
-      resetToken: token,
-      resetTokenExpiry: { $gt: Date.now() }, // Ensure the token is still valid
+    const user = await usersColl.findOne({
+      resetToken: hashedToken,
+      resetTokenExpiry: { $gt: Date.now() },
     });
-
     if (!user) {
-      return res.status(400).json({ message: 'Invalid or expired token.' });
+      return res.status(400).json({ message: "Invalid or expired token." });
     }
 
-    // Hash the new password
     const hashedPassword = await bcrypt.hash(newPassword, 10);
-
-    // Update the user's password and clear the reset token
-    await usersCollection.updateOne(
-      { resetToken: token },
+    await usersColl.updateOne(
+      { resetToken: hashedToken },
       {
         $set: { password: hashedPassword },
-        $unset: { resetToken: "", resetTokenExpiry: "" }, // Remove reset token fields
+        $unset: { resetToken: "", resetTokenExpiry: "" },
       }
     );
 
-    res.status(200).json({ message: 'Password reset successful!' });
+    res.status(200).json({ message: "Password reset successful!" });
   } catch (error) {
     console.error("Error resetting password:", error.message);
-    res.status(500).json({ message: 'An error occurred. Please try again.' });
+    res.status(500).json({ message: "An error occurred. Please try again." });
   }
 });
 
-// --- Get Pending Users Endpoint ---
-app.get('/pending-users', async (req, res) => {
-  console.log("GET /pending-users route called"); // Log route access
+// 10) Protected Admin/Owner Endpoints
+app.get("/users", authMiddleware, requireRole("admin"), async (req, res) => {
   try {
-    const usersCollection = db.collection("users");
-
-    // Query to fetch pending users
-    const pendingUsers = await usersCollection.find({ status: 'pending' }).toArray();
-
-    console.log("Pending Users from DB:", pendingUsers); // Log the fetched users
-
-    res.status(200).json(pendingUsers); // Respond with the pending users
+    const users = await db
+      .collection("users")
+      .find({}, { projection: { password: 0, resetToken: 0, resetTokenExpiry: 0 } })
+      .toArray();
+    res.status(200).json(users);
   } catch (error) {
-    console.error("Error fetching pending users:", error.message);
-    res.status(500).json({ message: 'An error occurred. Please try again.' });
+    console.error("Error fetching users:", error.message);
+    res.status(500).json({ message: "An error occurred." });
   }
 });
 
-// --- Server Listener ---
+app.put("/approve/:email", authMiddleware, requireRole("admin"), async (req, res) => {
+  const { email } = req.params;
+  try {
+    const user = await db.collection("users").findOne({ personalEmail: email });
+    if (!user) return res.status(404).json({ message: "User not found." });
+    if (user.status === "approved") {
+      return res.status(400).json({ message: "User is already approved." });
+    }
+
+    await db
+      .collection("users")
+      .updateOne({ personalEmail: email }, { $set: { status: "approved" } });
+
+    res.status(200).json({ message: "User approved successfully." });
+  } catch (error) {
+    console.error("Error approving user:", error.message);
+    res.status(500).json({ message: "An error occurred." });
+  }
+});
+
+app.put("/deny/:email", authMiddleware, requireRole("admin"), async (req, res) => {
+  const { email } = req.params;
+  try {
+    const user = await db.collection("users").findOne({ personalEmail: email });
+    if (!user) return res.status(404).json({ message: "User not found." });
+    if (user.status === "denied") {
+      return res.status(400).json({ message: "User is already denied." });
+    }
+
+    await db
+      .collection("users")
+      .updateOne({ personalEmail: email }, { $set: { status: "denied" } });
+
+    res.status(200).json({ message: "User denied successfully." });
+  } catch (error) {
+    console.error("Error denying user:", error.message);
+    res.status(500).json({ message: "An error occurred." });
+  }
+});
+
+app.put("/assign-admin/:email", authMiddleware, requireRole("admin"), async (req, res) => {
+  const { email } = req.params;
+  try {
+    const user = await db.collection("users").findOne({ loginEmail: email });
+    if (!user) return res.status(404).json({ message: "User not found." });
+    if (user.role === "admin") {
+      return res.status(400).json({ message: "User is already an admin." });
+    }
+
+    await db
+      .collection("users")
+      .updateOne({ loginEmail: email }, { $set: { role: "admin" } });
+    res.status(200).json({ message: `Admin role assigned to ${email} successfully.` });
+  } catch (error) {
+    console.error("Error assigning admin role:", error.message);
+    res.status(500).json({ message: "An error occurred." });
+  }
+});
+
+// Example manager route
+app.get("/manager/dashboard", authMiddleware, requireRole("manager"), (req, res) => {
+  res.status(200).json({ message: "Welcome to the manager dashboard!" });
+});
+
+// Example pilot route
+app.get("/pilot/dashboard", authMiddleware, requireRole("pilot"), (req, res) => {
+  res.status(200).json({ message: "Welcome to the pilot dashboard!" });
+});
+
+// Example loadmaster route
+app.get("/loadmaster/dashboard", authMiddleware, requireRole("loadmaster"), (req, res) => {
+  res.status(200).json({ message: "Welcome to the loadmaster dashboard!" });
+});
+
+// 11) Example route mounting for schedules & qualifications
+// (Remove or comment out if you haven't created them yet)
+const scheduleRoutes = require("./routes/scheduleRoutes"); // create this file
+app.use("/schedules", scheduleRoutes);
+
+const qualificationRoutes = require("./routes/qualificationRoutes"); // create this file
+app.use("/qualifications", qualificationRoutes);
+
+// 12) FCIF Routes
+// Create "routes/fcifRoutes.js" and "controllers/fcifController.js"
+const fcifRoutes = require("./routes/fcifRoutes");
+app.use("/fcifs", fcifRoutes);
+
+// 13) Start the server
 app.listen(PORT, () => {
-  connectToDatabase(); // Ensure database connection is established
-  console.log(`Server is running on http://localhost:${PORT}`);
+  console.log(`Server running on http://localhost:${PORT}`);
 });
