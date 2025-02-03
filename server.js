@@ -29,8 +29,11 @@ if (!MONGO_URI) {
   console.error("Error: MONGO_URI is not set in .env!");
   process.exit(1);
 }
-const JWT_SECRET = process.env.JWT_SECRET || "SomeFallbackSecretKey";
-
+const JWT_SECRET = process.env.JWT_SECRET; // Removed fallback
+if (!JWT_SECRET) {
+  console.error("Error: JWT_SECRET is not set in .env!");
+  process.exit(1);
+}
 // 3) Connect to MongoDB
 let client;
 let db;
@@ -38,10 +41,13 @@ async function connectToDatabase() {
   try {
     client = new MongoClient(MONGO_URI);
     await client.connect();
-    db = client.db("SQ23rdApp"); // or another DB name if you like
+    db = client.db("SQ23rdApp");
     console.log("Connected to MongoDB!");
 
-    // Attach the db to our Express app so sub-routes can access via req.app.locals.db
+    // Create indexes
+    await db.collection("users").createIndex({ loginEmail: 1 }, { unique: true });
+    await db.collection("users").createIndex({ personalEmail: 1 }, { unique: true });
+    
     app.locals.db = db;
   } catch (error) {
     console.error("Error connecting to MongoDB:", error.message);
@@ -163,9 +169,9 @@ function requireRole(requiredRole) {
   };
 }
 
-// 8) Registration & Login Endpoints
+/// 8) UPDATED Registration Endpoint
 app.post("/register", async (req, res) => {
-  const { email, password } = req.body;
+  const { email, password, name } = req.body; // Added name
 
   if (!email || !password) {
     return res.status(400).json({ message: "Email and password are required." });
@@ -186,12 +192,10 @@ app.post("/register", async (req, res) => {
       return res.status(400).json({ message: "User already exists." });
     }
 
-    // Generate login email from personal email
     const username = email.split("@")[0];
     const loginEmail = `${username}@sq23rd.com`;
-    const hashedPassword = await bcrypt.hash(password, 10);
+    const hashedPassword = await bcrypt.hash(password, 12); // Increased cost factor
 
-    // If this is the first user, set role=owner, status=approved
     const userCount = await usersColl.countDocuments();
     const isFirstUser = userCount === 0;
 
@@ -199,8 +203,10 @@ app.post("/register", async (req, res) => {
       personalEmail: email,
       loginEmail,
       password: hashedPassword,
+      name: name || "New User", // Added name field
       status: isFirstUser ? "approved" : "pending",
       role: isFirstUser ? "owner" : "user",
+      createdAt: new Date()
     };
 
     await usersColl.insertOne(newUser);
@@ -218,6 +224,7 @@ app.post("/register", async (req, res) => {
   }
 });
 
+// 9) UPDATED Login Endpoint (Critical Fix)
 app.post("/login", async (req, res) => {
   const { email, password } = req.body;
   if (!email || !password) {
@@ -240,18 +247,25 @@ app.post("/login", async (req, res) => {
 
     // Generate JWT
     const token = generateToken(user);
+    
+    // Updated response format
     res.status(200).json({
-      message: "Login successful!",
-      role: user.role,
       token,
+      user: {
+        email: user.loginEmail,
+        role: user.role,
+        name: user.name || "New User",
+        id: user._id.toString()
+      }
     });
+    
   } catch (error) {
     console.error("Error during login:", error.message);
     res.status(500).json({ message: "An error occurred. Please try again." });
   }
 });
 
-// 9) Password Reset
+// 10) Password Reset
 app.post("/request-password-reset", async (req, res) => {
   const { email } = req.body;
   if (!email) {
@@ -340,7 +354,7 @@ app.post("/reset-password", async (req, res) => {
   }
 });
 
-// 10) Protected Admin/Owner Endpoints
+// 11) Protected Admin/Owner Endpoints
 app.get("/users", authMiddleware, requireRole("admin"), async (req, res) => {
   try {
     const users = await db
@@ -428,7 +442,7 @@ app.get("/loadmaster/dashboard", authMiddleware, requireRole("loadmaster"), (req
   res.status(200).json({ message: "Welcome to the loadmaster dashboard!" });
 });
 
-// 11) Example route mounting for schedules & qualifications
+// 12) Example route mounting for schedules & qualifications
 // (Remove or comment out if you haven't created them yet)
 const scheduleRoutes = require("./routes/scheduleRoutes"); // create this file
 app.use("/schedules", scheduleRoutes);
@@ -436,12 +450,12 @@ app.use("/schedules", scheduleRoutes);
 const qualificationRoutes = require("./routes/qualificationRoutes"); // create this file
 app.use("/qualifications", qualificationRoutes);
 
-// 12) FCIF Routes
+// 13 FCIF Routes
 // Create "routes/fcifRoutes.js" and "controllers/fcifController.js"
 const fcifRoutes = require("./routes/fcifRoutes");
 app.use("/fcifs", fcifRoutes);
 
-// 13) Start the server
+// 14 Start the server
 app.listen(PORT, () => {
   console.log(`Server running on http://localhost:${PORT}`);
 });
