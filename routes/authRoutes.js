@@ -2,12 +2,28 @@
 const express = require("express");
 const { body, validationResult } = require("express-validator");
 const router = express.Router();
-const bcrypt = require("bcryptjs");
+const argon2 = require("argon2");
 const crypto = require("crypto");
 const nodemailer = require("nodemailer");
-const { generateToken } = require("../utils/authHelpers");
+const jwt = require("jsonwebtoken");
 
-const sendResponse = require("../utils/responseHelper");
+const JWT_SECRET = process.env.JWT_SECRET;
+if (!JWT_SECRET) {
+  console.error("JWT_SECRET not defined in environment variables");
+  process.exit(1);
+}
+
+// Utility function for generating JWT
+function generateToken(user) {
+  return jwt.sign(
+    {
+      userId: user._id.toString(),
+      role: user.role,
+    },
+    JWT_SECRET,
+    { expiresIn: "8h" }
+  );
+}
 
 // Configure nodemailer transporter
 const transporter = nodemailer.createTransport({
@@ -34,7 +50,9 @@ router.post(
   async (req, res, next) => {
     const errors = validationResult(req);
     if (!errors.isEmpty()) {
-      return res.status(400).json({ success: false, errors: errors.array() });
+      return res
+        .status(400)
+        .json({ success: false, errors: errors.array() });
     }
     const { email, password, name } = req.body;
     try {
@@ -42,11 +60,13 @@ router.post(
       const usersColl = db.collection("users");
       const existingUser = await usersColl.findOne({ personalEmail: email });
       if (existingUser) {
-        return res.status(400).json({ success: false, message: "User already exists." });
+        return res
+          .status(400)
+          .json({ success: false, message: "User already exists." });
       }
       const username = email.split("@")[0];
       const loginEmail = `${username}@sq23rd.com`;
-      const hashedPassword = await bcrypt.hash(password, 12);
+      const hashedPassword = await argon2.hash(password);
       const userCount = await usersColl.countDocuments();
       const isFirstUser = userCount === 0;
       const newUser = {
@@ -60,7 +80,9 @@ router.post(
       };
       await usersColl.insertOne(newUser);
       const msg = `Registration successful! Your login email will be ${loginEmail}. ${
-        isFirstUser ? "You have been assigned as the owner." : "Your account is pending admin approval."
+        isFirstUser
+          ? "You have been assigned as the owner."
+          : "Your account is pending admin approval."
       }`;
       return res.status(201).json({ success: true, message: msg });
     } catch (error) {
@@ -81,21 +103,29 @@ router.post(
   async (req, res, next) => {
     const errors = validationResult(req);
     if (!errors.isEmpty()) {
-      return res.status(400).json({ success: false, errors: errors.array() });
+      return res
+        .status(400)
+        .json({ success: false, errors: errors.array() });
     }
     const { email, password } = req.body;
     try {
       const db = req.app.locals.db;
       const user = await db.collection("users").findOne({ loginEmail: email });
       if (!user) {
-        return res.status(401).json({ success: false, message: "Invalid email or password." });
+        return res
+          .status(401)
+          .json({ success: false, message: "Invalid email or password." });
       }
       if (user.status !== "approved") {
-        return res.status(403).json({ success: false, message: "Your account is pending admin approval." });
+        return res
+          .status(403)
+          .json({ success: false, message: "Your account is pending admin approval." });
       }
-      const isPasswordCorrect = await bcrypt.compare(password, user.password);
+      const isPasswordCorrect = await argon2.verify(user.password, password);
       if (!isPasswordCorrect) {
-        return res.status(401).json({ success: false, message: "Invalid email or password." });
+        return res
+          .status(401)
+          .json({ success: false, message: "Invalid email or password." });
       }
       const token = generateToken(user);
       return res.status(200).json({
@@ -126,7 +156,9 @@ router.post(
   async (req, res, next) => {
     const errors = validationResult(req);
     if (!errors.isEmpty()) {
-      return res.status(400).json({ success: false, errors: errors.array() });
+      return res
+        .status(400)
+        .json({ success: false, errors: errors.array() });
     }
     const { email } = req.body;
     try {
@@ -136,7 +168,9 @@ router.post(
         personalEmail: { $regex: new RegExp(`^${email.trim()}$`, "i") },
       });
       if (!user) {
-        return res.status(404).json({ success: false, message: "User not found." });
+        return res
+          .status(404)
+          .json({ success: false, message: "User not found." });
       }
       // Generate reset token
       const token = crypto.randomBytes(32).toString("hex");
@@ -155,7 +189,9 @@ router.post(
         subject,
         text,
       });
-      return res.status(200).json({ success: true, message: "Password reset email sent!" });
+      return res
+        .status(200)
+        .json({ success: true, message: "Password reset email sent!" });
     } catch (error) {
       next(error);
     }
@@ -178,7 +214,9 @@ router.post(
   async (req, res, next) => {
     const errors = validationResult(req);
     if (!errors.isEmpty()) {
-      return res.status(400).json({ success: false, errors: errors.array() });
+      return res
+        .status(400)
+        .json({ success: false, errors: errors.array() });
     }
     const { token, newPassword } = req.body;
     try {
@@ -190,9 +228,11 @@ router.post(
         resetTokenExpiry: { $gt: Date.now() },
       });
       if (!user) {
-        return res.status(400).json({ success: false, message: "Invalid or expired token." });
+        return res
+          .status(400)
+          .json({ success: false, message: "Invalid or expired token." });
       }
-      const hashedPassword = await bcrypt.hash(newPassword, 10);
+      const hashedPassword = await argon2.hash(newPassword);
       await usersColl.updateOne(
         { resetToken: hashedToken },
         {
@@ -200,7 +240,9 @@ router.post(
           $unset: { resetToken: "", resetTokenExpiry: "" },
         }
       );
-      return res.status(200).json({ success: true, message: "Password reset successful!" });
+      return res
+        .status(200)
+        .json({ success: true, message: "Password reset successful!" });
     } catch (error) {
       next(error);
     }
